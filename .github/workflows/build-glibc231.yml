@@ -1,0 +1,153 @@
+name: build-glibc231
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  # 主任务：在 ubuntu:20.04 (glibc 2.31) 容器里直接构建自包含产物
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    timeout-minutes: 300
+    env:
+      CARGO_BUILD_JOBS: "2"
+      LIBGSSAPI_IMPL: mit
+    steps:
+      - name: Install build deps (focal)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates patchelf file \
+            pkg-config cmake clang \
+            libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            libfreetype6-dev libwayland-dev libx11-dev libxcb1-dev \
+            libzstd-dev libssl-dev libkrb5-dev
+          df -h / && nproc && free -h
+
+      - name: Install Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version
+
+      - name: Checkout tty7 v26.9.2
+        uses: actions/checkout@v4
+        with:
+          repository: l0ng-ai/tty7
+          ref: v26.9.2
+          path: tty7
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tty7
+
+      - name: Build
+        working-directory: tty7
+        run: |
+          cargo build --release --locked
+          df -h /
+
+      - name: Package self-contained bundle
+        working-directory: tty7
+        run: |
+          set -euo pipefail
+          V="26.9.2"
+          OUT="dist/tty7-${V}-linux-x86_64-glibc231"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/lib"
+          declare -A SEEN
+          queue=()
+          for b in tty7-app tty7 tty7-updater; do
+            [ -f "target/release/$b" ] && queue+=("target/release/$b")
+          done
+          libs=()
+          while [ "${#queue[@]}" -gt 0 ]; do
+            cur="${queue[0]}"
+            queue=("${queue[@]:1}")
+            while IFS= read -r so; do
+              [ -n "$so" ] || continue
+              bn="$(basename "$so")"
+              case "$bn" in
+                libc.so.6|libm.so.6|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-*|libcrypt.so.*) continue ;;
+              esac
+              if [ -z "${SEEN[$so]+x}" ]; then
+                SEEN["$so"]=1
+                libs+=("$so")
+                queue+=("$so")
+              fi
+            done < <(ldd "$cur" 2>/dev/null | awk '$3 ~ /^\// {print $3}')
+          done
+          for so in "${libs[@]}"; do cp -L "$so" "$OUT/lib/"; done
+          for b in tty7-app tty7 tty7-updater; do
+            [ -f "target/release/$b" ] || continue
+            cp "target/release/$b" "$OUT/"
+            patchelf --set-rpath '$ORIGIN/lib' "$OUT/$b"
+          done
+          ldd target/release/tty7-app > "$OUT/ldd.txt"
+          (cd dist && tar czf "tty7-${V}-linux-x86_64-glibc231.tar.gz" "tty7-${V}-linux-x86_64-glibc231")
+          ls -lh dist/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: tty7-glibc231
+          path: tty7/dist/tty7-26.9.2-linux-x86_64-glibc231.tar.gz
+          if-no-files-found: error
+
+  # 保险任务：并行打包"工具链 + 全部依赖缓存"。
+  # 仅当主任务因 runner 磁盘/内存不足失败时用到（本机 223G 磁盘 + 8 核离线编译）
+  offline-kit:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    timeout-minutes: 120
+    steps:
+      - name: Base tools
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates
+
+      - name: Rust stable
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout tty7 v26.9.2
+        uses: actions/checkout@v4
+        with:
+          repository: l0ng-ai/tty7
+          ref: v26.9.2
+          path: tty7
+
+      - name: Fetch all dependencies
+        working-directory: tty7
+        run: cargo fetch --locked
+
+      - name: Package toolchain + cargo cache
+        run: |
+          tar czf rustup-home.tar.gz -C "$HOME" .rustup
+          tar czf cargo-home.tar.gz -C "$HOME" .cargo
+          ls -lh *.tar.gz
+
+      - name: Upload toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustup-home
+          path: rustup-home.tar.gz
+
+      - name: Upload cargo cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-home
+          path: cargo-home.tar.gz
+
